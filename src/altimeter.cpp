@@ -12,6 +12,14 @@ void altimeter::initialize() {
     this->buffer[0] = 0x26;
     this->buffer[1] = 0x89;
     i2c_write_blocking(this->inst, this->addr, this->buffer, 2, true);
+
+    sleep_ms(1000);
+
+    float altitude = 0.0f;
+
+    while (altitude == 0.0f) {
+        altitude = this->get_altitude_converted();
+    }
 }
 
 void altimeter::initialize(float threshold_altitude, uint8_t interrupt_pin, gpio_irq_callback_t callback) {
@@ -60,19 +68,11 @@ void altimeter::initialize(float threshold_altitude, uint8_t interrupt_pin, gpio
     this->buffer[1] = 0x08;
     i2c_write_blocking(this->inst, this->addr, this->buffer, 2, true);
 
-    gpio_set_irq_enabled_with_callback(interrupt_pin, GPIO_IRQ_LEVEL_LOW, true, callback);
+    gpio_set_irq_enabled_with_callback(interrupt_pin, GPIO_IRQ_EDGE_FALL, true, callback);
     // End of configuration of interrupt for first transition from PAD to BOOST
 }
 
 void altimeter::set_threshold_altitude(float threshold_altitude, uint8_t interrupt_pin, gpio_irq_callback_t callback) {
-    float altitude = 0.0f;
-
-    while (altitude == 0.0f) {
-        altitude = get_altitude_converted();
-    }
-
-    threshold_altitude += altitude;
-
     // Select control register 3 (0x28)
     // Set bot interrupt pins to active low and enable internal pullups
     this->buffer[0] = 0x28;
@@ -103,12 +103,12 @@ void altimeter::set_threshold_altitude(float threshold_altitude, uint8_t interru
     this->buffer[1] = 0x08;
     i2c_write_blocking(this->inst, this->addr, this->buffer, 2, true);
 
-    gpio_set_irq_enabled_with_callback(interrupt_pin, GPIO_IRQ_LEVEL_LOW, true, callback);
+    gpio_set_irq_enabled_with_callback(interrupt_pin, GPIO_IRQ_EDGE_FALL, true, callback);
     // End of configuration of interrupt for first transition from PAD to BOOST
 }
 
 void altimeter::unset_threshold_altitude(uint8_t interrupt_pin) {
-    gpio_set_irq_enabled_with_callback(interrupt_pin, GPIO_IRQ_LEVEL_LOW, false, NULL);
+    gpio_set_irq_enabled_with_callback(interrupt_pin, GPIO_IRQ_EDGE_FALL, false, NULL);
 
     // Select interrupt enable register (0x29)
     // Set interrupt enabled for altitude threshold(0x08)
