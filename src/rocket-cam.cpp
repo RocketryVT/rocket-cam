@@ -8,106 +8,125 @@
 #include "pico/time.h"
 #include "pico/types.h"
 #include "pico/cyw43_arch.h"
-#include <inttypes.h>
+#include <cstdio>
 #include <math.h>
 
 #include "altimeter.hpp"
+#include "irc_tramp.hpp"
+#include "osd.hpp"
+#include "pins.hpp"
 
-#define MOVING_AVG_MAX_SIZE 10
-#define MPL3115A2_ADDR 0x60
+#define DEBUG_USB 
 
-#define MAX_SCL 400000
-#define DATA_RATE_HZ 100
-#define LOOP_PERIOD (1.0f / DATA_RATE_HZ)
-#define INT1_PIN 13 // INT1 PIN on MPL3115A2 connected to GPIO13
-#define CAM_SDA 14
-#define CAM_SCL 15
-#define CAM_PIN 0
+#if defined(DEBUG_USB)
+    #include "debug.hpp"
+#endif
 
-#define HEART_RATE_HZ 5
-
-typedef enum {
-    PAD = 0,
-    BOOST,
-    COAST,
-    APOGEE,
-    RECOVERY,
-    END
-} state_t;
 
 void pad_callback(uint gpio, uint32_t event_mask);
 int64_t set_altitude_callback(alarm_id_t id, void* user_data);
-void end_callback(uint gpio, uint32_t event_mask);
 int64_t toggle_camera_callback(alarm_id_t id, void* user_data);
 int64_t end_timeout_callback(alarm_id_t id, void* user_data);
 bool changing_altitude_callback(repeating_timer_t *rt);
 bool heartbeat_callback(repeating_timer_t *rt);
 void heartbeat_core();
+void vtx_init();
+const char* state_name(state_t current_state);
 
-volatile float altitude = 0.0f;
-volatile float prev_altitude = 0.0f;
-volatile state_t state = PAD;
-volatile float threshold_altitude = 30.0f;
-volatile float ground_altitude = 0.0f;
-
-volatile uint8_t led_counter;
-
-volatile bool enabled_camera = false;
+volatile float     altitude       = 0.0f;
+volatile float     prev_altitude  = 0.0f;
+volatile float     ground_altitude = 0.0f;
+volatile state_t   state          = PAD;
+volatile uint8_t   led_counter    = 0;
+volatile bool      enabled_camera = false;
 
 repeating_timer_t data_timer;
 repeating_timer_t heartbeat_timer;
-
-altimeter altimeter(i2c1, MPL3115A2_ADDR);
-
 volatile alarm_id_t end_timer;
+
+altimeter altimeter(ALT_I2C_INST, ALT_I2C_ADDR);
+IrcTramp  vtx(VTX_PIO, PIN_VTX);
+Osd       osd(OSD_UART, PIN_OSD_TX, PIN_OSD_RX);
 
 int main() {
     cyw43_arch_init();
+    #if defined(DEBUG_USB)
+    debug_init();
+    #endif
 
-    i2c_init(i2c1, MAX_SCL);
-    gpio_set_function(CAM_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(CAM_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(CAM_SDA);
-    gpio_pull_up(CAM_SCL);
+    // Altimeter I2C
+    i2c_init(ALT_I2C_INST, ALT_I2C_BAUD);
+    gpio_set_function(PIN_ALT_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(PIN_ALT_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(PIN_ALT_SDA);
+    gpio_pull_up(PIN_ALT_SCL);
 
-    gpio_init(INT1_PIN);
-    gpio_pull_up(INT1_PIN);
+    gpio_init(PIN_ALT_INT1);
+    gpio_pull_up(PIN_ALT_INT1);
 
-    gpio_init(CAM_PIN);
-    gpio_set_dir(CAM_PIN, GPIO_OUT);
-    gpio_pull_down(CAM_PIN);
-    gpio_put(CAM_PIN, 0);
-    
+    // Camera trigger pin
+    gpio_init(PIN_CAM);
+    gpio_set_dir(PIN_CAM, GPIO_OUT);
+    gpio_pull_down(PIN_CAM);
+    gpio_put(PIN_CAM, 0);
+
     alarm_pool_init_default();
-
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
 
     altimeter.initialize();
-
     ground_altitude = altimeter.get_altitude_converted();
-    altimeter.set_threshold_altitude((ground_altitude + threshold_altitude), INT1_PIN, &pad_callback);
+    prev_altitude = ground_altitude;
+    altimeter.set_threshold_altitude(
+        ground_altitude + LAUNCH_THRESHOLD_M, PIN_ALT_INT1, &pad_callback);
+
+    vtx_init();
+    osd.begin();
+    add_repeating_timer_ms(1000, changing_altitude_callback, NULL, &data_timer);
 
     sleep_ms(5000);
     toggle_camera_callback(0, NULL);
 
     multicore_launch_core1(heartbeat_core);
 
-    while (1) {
-        tight_loop_contents();
+#if defined(DEBUG_USB)
+    while (1) { debug_poll(); }
+#else
+    while (1) { tight_loop_contents(); }
+#endif
+}
+
+// Set VTX to boot frequency and power, RF on. Retries 3x if no response.
+void vtx_init() {
+    vtx.begin();
+    sleep_ms(500);  // VTX power-on settling
+
+    const uint16_t freq  = vtx_frequency(VtxBand::A, VtxChannel::CH1);
+    const uint16_t power = vtx_power_mw(VtxPower::MW4000);
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        TrampRFLimits limits;
+        if (!vtx.init_rf(limits)) {
+            sleep_ms(200);
+            continue;
+        }
+        vtx.set_frequency(freq);
+        sleep_ms(200);
+        vtx.set_power(power);
+        sleep_ms(200);
+        vtx.set_active(true);
+        return;
     }
+    // VTX unresponsive — continue without it
 }
 
 void pad_callback(uint gpio, uint32_t event_mask) {
-    altimeter.unset_threshold_altitude(INT1_PIN);
+    altimeter.unset_threshold_altitude(PIN_ALT_INT1);
     state = BOOST;
-    // I actually don't care what state the rocket is in for cam activity, i just need to know when it launches and when it lands
     add_alarm_in_ms(1000, &set_altitude_callback, NULL, true);
 }
 
 int64_t set_altitude_callback(alarm_id_t id, void* user_data) {
-    add_repeating_timer_ms(1000, changing_altitude_callback, NULL, &data_timer);
-
-    end_timer = add_alarm_in_ms(1800000, end_timeout_callback, NULL, true);
+    end_timer = add_alarm_in_ms(FLIGHT_TIMEOUT_MS, end_timeout_callback, NULL, true);
     return 0;
 }
 
@@ -115,51 +134,48 @@ int64_t end_timeout_callback(alarm_id_t, void* user_data) {
     cancel_repeating_timer(&data_timer);
     state = END;
     toggle_camera_callback(0, NULL);
+    vtx.set_active(false);  // pit mode on landing
     return 0;
 }
 
-// HEARTBEAT THREAD
-//===============================================================================
+// =============================================================================
+// Heartbeat (core 1)
+// =============================================================================
 
 void heartbeat_core() {
-    add_repeating_timer_us(-1000000 / HEART_RATE_HZ,  &heartbeat_callback, NULL, &heartbeat_timer);
-
-    while (1) {
-        tight_loop_contents();
-    }
+    add_repeating_timer_us(
+        -1000000 / HEARTBEAT_HZ, &heartbeat_callback, NULL, &heartbeat_timer);
+    while (1) { tight_loop_contents(); }
 }
 
 bool heartbeat_callback(repeating_timer_t *rt) {
-    const bool sequence_0[] = {true, false, true, false, false};
-    const bool sequence_1[] = {true, true, true, true, false};
-    const bool sequence_2[] = {false, false, false, false, true};
-    const uint8_t sequence_length = 5;
+    // PAD:  short double-blink
+    // BOOST: solid on
+    // END:  slow single blink
+    const bool seq_pad[]   = {true, false, true, false, false};
+    const bool seq_boost[] = {true, true,  true, true,  false};
+    const bool seq_end[]   = {false, false, false, false, true};
 
-    bool led_status = true;
-    if (state == PAD) {
-        led_status = sequence_0[led_counter];
-    } else if (state == BOOST) {
-        led_status = sequence_1[led_counter];
-    } else if (state == END) {
-        led_status = sequence_2[led_counter];
-    }
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_status);
-    led_counter++;
-    led_counter %= sequence_length;
+    bool on;
+    if (state == PAD)        on = seq_pad[led_counter];
+    else if (state == BOOST) on = seq_boost[led_counter];
+    else                     on = seq_end[led_counter];
 
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, on);
+    led_counter = (led_counter + 1) % 5;
     return true;
 }
 
+// =============================================================================
+// Camera toggle
+// =============================================================================
 
 int64_t toggle_camera_callback(alarm_id_t id, void* user_data) {
     static bool toggled = false;
-    gpio_put(CAM_PIN, !toggled);
+    gpio_put(PIN_CAM, !toggled);
     if (!toggled) {
-        if (!enabled_camera) {
-            add_alarm_in_ms(5000, toggle_camera_callback, NULL, true);
-        } else {
-            add_alarm_in_ms(1000, toggle_camera_callback, NULL, true);
-        }
+        uint32_t delay = enabled_camera ? 1000 : 5000;
+        add_alarm_in_ms(delay, toggle_camera_callback, NULL, true);
         toggled = true;
         return 0;
     }
@@ -168,22 +184,57 @@ int64_t toggle_camera_callback(alarm_id_t id, void* user_data) {
     return 0;
 }
 
+const char* state_name(state_t current_state) {
+    switch (current_state) {
+    case PAD:
+        return "PAD";
+    case BOOST:
+        return "BOOST";
+    case COAST:
+        return "COAST";
+    case APOGEE:
+        return "APOGEE";
+    case RECOVERY:
+        return "RECOVERY";
+    case END:
+        return "END";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+// =============================================================================
+// Altitude monitoring (1 Hz)
+// =============================================================================
+
 bool changing_altitude_callback(repeating_timer_t *rt) {
     static uint32_t static_counter = 0;
-    altitude = altimeter.get_altitude_converted();
+    char vtx_status[50];
+    char stage_status[50];
 
-    if (fabs(altitude - prev_altitude) <= 1.f) {
+    altitude       = altimeter.get_altitude_converted();
+    float climb    = altitude - prev_altitude;  // m/s (fires at 1 Hz)
+    float alt_agl  = altitude - ground_altitude;
+
+    snprintf(vtx_status, sizeof(vtx_status), "BAND A CH 1 4000MW");
+    snprintf(stage_status, sizeof(stage_status), "FLIGHT STAGE: %s", state_name(state));
+
+    osd.update(alt_agl, climb, static_cast<uint32_t>(state), vtx_status, stage_status);
+
+    if (state != PAD && fabsf(climb) <= LANDING_THRESHOLD_M) {
         static_counter++;
+    } else {
+        static_counter = 0;
     }
 
-    if (static_counter >= 30) {
+    if (static_counter >= LANDING_COUNT) {
         state = END;
         cancel_repeating_timer(&data_timer);
         cancel_alarm(end_timer);
         toggle_camera_callback(0, NULL);
+        vtx.set_active(false);  // pit mode on landing
     }
 
     prev_altitude = altitude;
-
     return true;
 }

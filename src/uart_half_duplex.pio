@@ -1,0 +1,91 @@
+; Half-duplex single-wire UART for IRC Tramp (9600 8N1)
+;
+; TX program: clk_div = sys_clk / (baud * 2)  → each SM cycle = 0.5 bit period
+;   - .side_set 1 opt: instructions without an explicit 'side' leave the pin alone,
+;     so 'jmp' does NOT pull the line low between data bits (NRZ not RZ).
+;   - Each instruction pair (out + jmp) = 2 ticks = 1 bit period.
+;   - pull [1] and set [1] each = 2 ticks = 1 bit period for idle/start.
+;
+; RX program: clk_div = sys_clk / (baud * 8)  → each SM cycle = 1/8 bit period
+;   - wait catches falling edge at t=0
+;   - set x,7 [10] = 11 ticks; first 'in' fires at t=12 = 1.5 bits = centre of bit 0
+;   - in (1 tick) + jmp [6] (7 ticks) = 8 ticks = 1 bit period between samples
+;
+; Both programs use the same single GPIO pin.
+
+; ---------------------------------------------------------------------------
+; TX: one SM cycle = 0.5 bit period  (clk_div = sys_clk / (baud * 2))
+; ---------------------------------------------------------------------------
+.program uart_hd_tx
+.side_set 1 opt
+
+; opt side-set: instructions that omit 'side' do NOT drive the side-set pin.
+; This means the 'jmp' does not force the line low between data bits (NRZ-L).
+.wrap_target
+    pull    block        side 1 [1]  ; wait for byte; hold line high (2 ticks = 1 bit)
+    set     x, 7         side 0 [1]  ; assert start bit (low, 2 ticks = 1 bit)
+bitloop:
+    out     pins, 1                  ; output data bit (1 tick, no side-set)
+    jmp     x-- bitloop              ; (1 tick, no side-set → pin retains out value)
+    nop                  side 1 [1]  ; stop bit (high, 2 ticks = 1 bit)
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+static inline void uart_hd_tx_program_init(PIO pio, uint sm, uint offset,
+                                           uint pin, uint baud) {
+    pio_sm_config c = uart_hd_tx_program_get_default_config(offset);
+    sm_config_set_out_shift(&c, true, true, 8);   // shift right, autopull at 8
+    sm_config_set_out_pins(&c, pin, 1);
+    sm_config_set_sideset_pins(&c, pin);
+    // Drive pin high initially (idle / mark state)
+    pio_sm_set_pins_with_mask(pio, sm, 1u << pin, 1u << pin);
+    pio_sm_set_pindirs_with_mask(pio, sm, 1u << pin, 1u << pin);
+    pio_gpio_init(pio, pin);
+    // 2x clock: out+jmp = 2 ticks = 1 bit; pull[1] and set[1] also 2 ticks each
+    float div = (float)clock_get_hz(clk_sys) / ((float)baud * 2.0f);
+    sm_config_set_clkdiv(&c, div);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+; ---------------------------------------------------------------------------
+; RX: one SM cycle = 1/8 bit period  (clk_div = sys_clk / (baud * 8))
+;     At 9600 baud: 1 bit = 104.2 µs, 1 tick = 13.0 µs
+;
+; Timing from falling edge (t=0):
+;   t=1..11  set x,7 [10]  (11 ticks)
+;   t=12     first 'in'    → centre of bit 0  (1.5 bits = 12 ticks) ✓
+;   t=12+8N  Nth 'in'      → centre of bit N  (in 1 tick + jmp [6] 7 ticks = 8 ticks/bit)
+; ---------------------------------------------------------------------------
+.program uart_hd_rx
+
+.wrap_target
+    wait    0 pin 0             ; wait for start bit (falling edge)
+    set     x, 7        [10]   ; 8 bits to receive; delay to centre of first data bit
+bitloop:
+    in      pins, 1             ; sample data bit at mid-bit (1 tick)
+    jmp     x-- bitloop  [6]   ; 7 ticks delay; total 8 ticks/bit = 1 bit period ✓
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+static inline void uart_hd_rx_program_init(PIO pio, uint sm, uint offset,
+                                           uint pin, uint baud) {
+    pio_sm_config c = uart_hd_rx_program_get_default_config(offset);
+    // Right-shift: received bits accumulate in ISR[31:24]; read with >> 24
+    sm_config_set_in_shift(&c, true, true, 8);
+    sm_config_set_in_pins(&c, pin);
+    // Pin is input — do not set as output
+    pio_sm_set_pindirs_with_mask(pio, sm, 0u, 1u << pin);
+    pio_gpio_init(pio, pin);
+    gpio_pull_up(pin);
+    // Each tick = 1/8 of a bit period
+    float div = (float)clock_get_hz(clk_sys) / ((float)baud * 8.0f);
+    sm_config_set_clkdiv(&c, div);
+    pio_sm_init(pio, sm, offset, &c);
+    // Start disabled; irc_tramp.cpp enables it when switching to RX
+    pio_sm_set_enabled(pio, sm, false);
+}
+%}
