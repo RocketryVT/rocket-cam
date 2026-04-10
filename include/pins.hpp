@@ -10,19 +10,19 @@
 // Accessed through cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, ...)
 
 // Altimeter (MPL3115A2) — I2C1
-const uint8_t PIN_ALT_SDA   = 14;
-const uint8_t PIN_ALT_SCL   = 15;
-const uint8_t PIN_ALT_INT1  = 13;  // INT1 interrupt output from sensor
+const uint8_t PIN_ALT_SDA   = 18;
+const uint8_t PIN_ALT_SCL   = 19;
+const uint8_t PIN_ALT_INT1  = 21;  // INT1 interrupt output from sensor
 
 // Camera trigger (Runcam Mini DVR)
 const uint8_t PIN_CAM       = 0;   // Pull high to start/stop recording
 
 // VTX (RushFPV 3.3GHz 4W) — single-wire half-duplex IRC Tramp via PIO
-const uint8_t PIN_VTX       = 4;
+const uint8_t PIN_VTX       = 20;
 
 // OSD (Holybro Micro OSD V2) — full-duplex UART
-const uint8_t PIN_OSD_TX    = 0;   // uart0 TX
-const uint8_t PIN_OSD_RX    = 1;   // uart0 RX
+const uint8_t PIN_OSD_TX    = 12;   // uart0 TX
+const uint8_t PIN_OSD_RX    = 13;   // uart0 RX
 
 // =============================================================================
 // Peripheral configuration
@@ -32,9 +32,6 @@ const uint8_t PIN_OSD_RX    = 1;   // uart0 RX
 #define ALT_I2C_INST        i2c1
 #define ALT_I2C_BAUD        400000
 #define ALT_I2C_ADDR        0x60   // MPL3115A2
-
-// Camera
-#define CAM_I2C_INST        i2c1   // shared bus with altimeter
 
 // VTX PIO
 #define VTX_PIO             pio0
