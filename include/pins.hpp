@@ -108,5 +108,5 @@ typedef enum {
 // Boot configuration
 constexpr VtxBand    VTX_BOOT_BAND    = VtxBand::A;
 constexpr VtxChannel VTX_BOOT_CHANNEL = VtxChannel::CH1;
-constexpr VtxPower   VTX_BOOT_POWER   = VtxPower::MW4000;
+constexpr VtxPower   VTX_BOOT_POWER   = VtxPower::MW200;
 constexpr VtxPower   VTX_LAND_POWER   = VtxPower::PIT;

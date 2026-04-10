@@ -229,16 +229,18 @@ static void flight_task(void*) {
             }
         }
 
-        // Start recording on first exit from PAD (hardware launch or USB force)
+        // Start recording and go full power on first exit from PAD
         if (prev_state == PAD && state != PAD) {
+            g_vtx.set_power(vtx_power_mw(VtxPower::MW4000));
             camera_start();
+            
         }
 
         // On first entry to END: stop camera and put VTX in pit mode
         if (state == END && !ended) {
             ended = true;
+            g_vtx.set_power(vtx_power_mw(VtxPower::PIT));
             camera_stop();
-            g_vtx.set_active(false);
         }
 
         // OSD update
