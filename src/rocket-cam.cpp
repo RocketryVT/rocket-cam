@@ -12,7 +12,8 @@
 #include "altimeter.hpp"
 #include "irc_tramp.hpp"
 #include "osd.hpp"
-#include "shared.hpp"   // FlightState, NOTIF_*, queue externs
+#include "ble.hpp"      // ble_init, ble_take_cam_cmd, ble_publish_cam_cfg
+#include "shared.hpp"   // FlightState, NOTIF_*, CamCmd/CamCfg, queue externs
 
 // ---------------------------------------------------------------------------
 // Queue and task handle definitions (declared extern in shared.hpp)
@@ -118,6 +119,9 @@ static StackType_t   s_heartbeat_stack[256];
 static StaticTask_t  s_usb_tcb;
 static StackType_t   s_usb_stack[1024];
 
+static StaticTask_t  s_ble_tcb;
+static StackType_t   s_ble_stack[1024];
+
 static void pad_callback(uint /*gpio*/, uint32_t /*event_mask*/) {
     g_altimeter.unset_threshold_altitude(PIN_ALT_INT1);
     BaseType_t woken = pdFALSE;
@@ -174,6 +178,16 @@ static void flight_task(void*) {
     TimerHandle_t end_timer    = nullptr;
     bool          ended        = false;
 
+    // Tracked VTX config for BLE status reporting, seeded from the boot config
+    // that vtx_task applies in vtx_init(). Channel is 1-based, like the console.
+    uint8_t  vtx_band       = (uint8_t)VTX_BOOT_BAND;
+    uint8_t  vtx_channel    = (uint8_t)VTX_BOOT_CHANNEL + 1;
+    uint16_t vtx_freq       = vtx_frequency(VTX_BOOT_BAND, VTX_BOOT_CHANNEL);
+    uint8_t  vtx_power      = (uint8_t)VTX_BOOT_POWER;
+    bool     vtx_rf         = true;
+    uint16_t vtx_actual_mw  = 0;
+    bool     vtx_responsive = false;
+
     // Publish initial state
     FlightState fs{PAD, 0.0f, 0.0f, s_camera_on};
     xQueueOverwrite(g_state_q, &fs);
@@ -187,6 +201,43 @@ static void flight_task(void*) {
         if (notif & NOTIF_CAM) {
             if (s_camera_on) camera_stop();
             else             camera_start();
+        }
+
+        // Apply any BLE camera commands. Only the fields the phone set (has_*)
+        // are touched; everything is routed through the existing g_vtx driver
+        // so there is a single owner of the VTX and the camera GPIO.
+        CamCmd bc;
+        while (ble_take_cam_cmd(&bc)) {
+            if (bc.has_freq) {
+                vtx_freq    = bc.freq_mhz;
+                vtx_channel = 0;  // explicit frequency, off the channel grid
+                g_vtx.set_frequency(vtx_freq);
+            } else if (bc.has_band || bc.has_channel) {
+                if (bc.has_band)    vtx_band    = bc.band;
+                if (bc.has_channel) vtx_channel = bc.channel;
+                VtxChannel ch = (vtx_channel >= 1 && vtx_channel <= 8)
+                              ? static_cast<VtxChannel>(vtx_channel - 1)
+                              : VtxChannel::CH1;
+                vtx_freq = vtx_frequency(static_cast<VtxBand>(vtx_band), ch);
+                g_vtx.set_frequency(vtx_freq);
+            }
+            if (bc.has_power) {
+                vtx_power = bc.power;
+                g_vtx.set_power(vtx_power_mw(static_cast<VtxPower>(vtx_power)));
+            }
+            if (bc.has_rf) {
+                vtx_rf = bc.rf_enabled;
+                g_vtx.set_active(vtx_rf);
+            }
+            if (bc.has_record) {
+                if (bc.camera_record) camera_start();
+                else                  camera_stop();
+            }
+            if (bc.request_status) {
+                TrampStatus ts{};
+                vtx_responsive = g_vtx.get_config(ts);
+                if (vtx_responsive) vtx_actual_mw = ts.actual_power;
+            }
         }
 
         // Snapshot state before any transitions this iteration
@@ -232,14 +283,16 @@ static void flight_task(void*) {
         // Start recording and go full power on first exit from PAD
         if (prev_state == PAD && state != PAD) {
             g_vtx.set_power(vtx_power_mw(VtxPower::MW4000));
+            vtx_power = (uint8_t)VtxPower::MW4000;
             camera_start();
-            
+
         }
 
         // On first entry to END: stop camera and put VTX in pit mode
         if (state == END && !ended) {
             ended = true;
             g_vtx.set_power(vtx_power_mw(VtxPower::PIT));
+            vtx_power = (uint8_t)VtxPower::PIT;
             camera_stop();
         }
 
@@ -262,9 +315,22 @@ static void flight_task(void*) {
         FlightState pub{state, alt_agl, climb, s_camera_on};
         xQueueOverwrite(g_state_q, &pub);
 
-        if (state == END) {
-            vTaskSuspend(nullptr);
-        }
+        // Publish a config/status snapshot for BLE reads + notifications.
+        CamCfg cc;
+        cc.band             = vtx_band;
+        cc.channel          = vtx_channel;
+        cc.freq_mhz         = vtx_freq;
+        cc.power            = vtx_power;
+        cc.actual_power_mw  = vtx_actual_mw;
+        cc.rf_enabled       = vtx_rf;
+        cc.camera_recording = s_camera_on;
+        cc.flight_state     = (uint8_t)state;
+        cc.altitude_agl_m   = alt_agl;
+        cc.vtx_responsive   = vtx_responsive;
+        ble_publish_cam_cfg(&cc);
+
+        // NOTE: we intentionally do NOT vTaskSuspend() at END — the loop keeps
+        // running so the camera/VTX stay reconfigurable over BLE on the ground.
     }
 }
 
@@ -275,6 +341,17 @@ static void flight_task(void*) {
 static void vtx_task(void*) {
     vtx_init();
     vTaskDelete(nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// ble_task  (priority 2, core 0) — brings up the BLE GATT peripheral, then
+// idles. BTstack runs in the cyw43 async context, so no run loop is needed
+// here once initialised.
+// ---------------------------------------------------------------------------
+
+static void ble_task(void*) {
+    ble_init();
+    vTaskDelay(portMAX_DELAY);
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +458,8 @@ int main() {
                           s_heartbeat_stack, &s_heartbeat_tcb);
     xTaskCreateStatic(usb_task,       "usb",       1024, nullptr, 1,
                       s_usb_stack,       &s_usb_tcb);
+    xTaskCreateStatic(ble_task,       "ble",       1024, nullptr, 2,
+                      s_ble_stack,       &s_ble_tcb);
 
     // Pin heartbeat to core 1; all others run on core 0 by default
     vTaskCoreAffinitySet(s_heartbeat_task_handle, 1u << 1);

@@ -1,0 +1,20 @@
+// rocket-cam SIGMA2 camera-control GATT database.
+//
+// Custom 128-bit service with two characteristics:
+//   CMD    (write)         — phone writes a nanopb sigma2.Envelope{cam_command}
+//   STATUS (read + notify) — device returns a nanopb sigma2.Envelope{cam_config}
+//
+// compile_gatt.py turns this into sigma2_cam.h (profile_data[] + handle macros).
+
+// Generic Access Profile
+PRIMARY_SERVICE, GAP_SERVICE
+CHARACTERISTIC, GAP_DEVICE_NAME, READ, "RocketCam"
+
+// Generic Attribute Profile
+PRIMARY_SERVICE, GATT_SERVICE
+CHARACTERISTIC, GATT_DATABASE_HASH, READ,
+
+// SIGMA2 camera-control service
+PRIMARY_SERVICE, 9A8B0001-7C6D-4B2A-9E3F-1C2D3E4F5060
+CHARACTERISTIC, 9A8B0002-7C6D-4B2A-9E3F-1C2D3E4F5060, WRITE | DYNAMIC,
+CHARACTERISTIC, 9A8B0003-7C6D-4B2A-9E3F-1C2D3E4F5060, READ | NOTIFY | DYNAMIC,
