@@ -43,22 +43,25 @@ static uint32_t s_cfg_notified = 0;  // last version pushed as a notification
 // ---------------------------------------------------------------------------
 static hci_con_handle_t s_con_handle = HCI_CON_HANDLE_INVALID;
 static bool             s_notify_on  = false;
+static volatile bool    s_ble_ready  = false;
+static volatile int     s_ble_init_result = PICO_ERROR_GENERIC;
 static btstack_packet_callback_registration_t s_hci_cb;
 static btstack_timer_source_t                 s_status_timer;
 
-// Advertise just flags + the complete local name "RocketCam".
+// Advertise flags + the camera-control service UUID. iOS service-filtered
+// scans match the primary advertising payload more reliably than scan response
+// data, so keep the UUID here and put the human-readable name in scan response.
 static const uint8_t s_adv_data[] = {
     0x02, BLUETOOTH_DATA_TYPE_FLAGS, 0x06,
-    0x0A, BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME,
-    'R', 'o', 'c', 'k', 'e', 't', 'C', 'a', 'm',
-};
-
-// Scan response carries the 128-bit service UUID (little-endian) so a central
-// can filter by service if it wants to.
-static const uint8_t s_scan_resp_data[] = {
     0x11, BLUETOOTH_DATA_TYPE_COMPLETE_LIST_OF_128_BIT_SERVICE_CLASS_UUIDS,
     0x60, 0x50, 0x4F, 0x3E, 0x2D, 0x1C, 0x3F, 0x9E,
     0x2A, 0x4B, 0x6D, 0x7C, 0x01, 0x00, 0x8B, 0x9A,
+};
+
+// Scan response carries the complete local name "RocketCam".
+static const uint8_t s_scan_resp_data[] = {
+    0x0A, BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME,
+    'R', 'o', 'c', 'k', 'e', 't', 'C', 'a', 'm',
 };
 
 // ---------------------------------------------------------------------------
@@ -183,7 +186,14 @@ static void status_timer_cb(btstack_timer_source_t* ts) {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-void ble_init() {
+bool ble_init() {
+    if (s_ble_ready) return true;
+
+    s_ble_init_result = cyw43_arch_init();
+    if (s_ble_init_result != 0) {
+        return false;
+    }
+
     l2cap_init();
     sm_init();
 
@@ -206,11 +216,24 @@ void ble_init() {
     btstack_run_loop_add_timer(&s_status_timer);
 
     hci_power_control(HCI_POWER_ON);
+    s_ble_ready = true;
+    return true;
+}
+
+bool ble_is_ready() {
+    return s_ble_ready;
+}
+
+int ble_init_result() {
+    return s_ble_init_result;
 }
 
 bool ble_take_cam_cmd(CamCmd* out) {
+    if (!s_ble_ready || !out) return false;
+
     bool got = false;
     async_context_t* ctx = cyw43_arch_async_context();
+    if (!ctx) return false;
     async_context_acquire_lock_blocking(ctx);
     if (s_cmd_pending) {
         *out          = s_cmd;
@@ -222,7 +245,15 @@ bool ble_take_cam_cmd(CamCmd* out) {
 }
 
 void ble_publish_cam_cfg(const CamCfg* cfg) {
+    if (!cfg) return;
+
     async_context_t* ctx = cyw43_arch_async_context();
+    if (!s_ble_ready || !ctx) {
+        s_cfg = *cfg;
+        s_cfg_version++;
+        return;
+    }
+
     async_context_acquire_lock_blocking(ctx);
     s_cfg = *cfg;
     s_cfg_version++;

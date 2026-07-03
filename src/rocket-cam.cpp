@@ -223,7 +223,14 @@ static void flight_task(void*) {
             }
             if (bc.has_power) {
                 vtx_power = bc.power;
-                g_vtx.set_power(vtx_power_mw(static_cast<VtxPower>(vtx_power)));
+                if (static_cast<VtxPower>(vtx_power) == VtxPower::PIT) {
+                    vtx_rf = false;
+                    g_vtx.set_active(false);
+                } else {
+                    vtx_rf = true;
+                    g_vtx.set_active(true);
+                    g_vtx.set_power(vtx_power_mw(static_cast<VtxPower>(vtx_power)));
+                }
             }
             if (bc.has_rf) {
                 vtx_rf = bc.rf_enabled;
@@ -282,8 +289,10 @@ static void flight_task(void*) {
 
         // Start recording and go full power on first exit from PAD
         if (prev_state == PAD && state != PAD) {
+            g_vtx.set_active(true);
             g_vtx.set_power(vtx_power_mw(VtxPower::MW4000));
             vtx_power = (uint8_t)VtxPower::MW4000;
+            vtx_rf = true;
             camera_start();
 
         }
@@ -291,8 +300,9 @@ static void flight_task(void*) {
         // On first entry to END: stop camera and put VTX in pit mode
         if (state == END && !ended) {
             ended = true;
-            g_vtx.set_power(vtx_power_mw(VtxPower::PIT));
+            g_vtx.set_active(false);
             vtx_power = (uint8_t)VtxPower::PIT;
+            vtx_rf = false;
             camera_stop();
         }
 
@@ -350,7 +360,9 @@ static void vtx_task(void*) {
 // ---------------------------------------------------------------------------
 
 static void ble_task(void*) {
-    ble_init();
+    if (!ble_init()) {
+        printf("BLE init failed: %d\r\n", ble_init_result());
+    }
     vTaskDelay(portMAX_DELAY);
 }
 
@@ -378,7 +390,9 @@ static void heartbeat_task(void*) {
         else if (fs.state == END) on = seq_end[idx];
         else                      on = seq_boost[idx];
 
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, on);
+        if (ble_is_ready()) {
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, on);
+        }
         idx = (idx + 1) % 5;
         vTaskDelay(period);
     }
@@ -437,7 +451,6 @@ void vApplicationGetTimerTaskMemory(StaticTask_t** ppxTimerTaskTCBBuffer,
 
 int main() {
     stdio_init_all();
-    cyw43_arch_init();
 
     g_state_q        = xQueueCreateStatic(1, sizeof(FlightState),
                                           s_state_q_storage, &s_state_q_buf);
@@ -456,9 +469,9 @@ int main() {
     s_heartbeat_task_handle =
         xTaskCreateStatic(heartbeat_task, "heartbeat", 256,  nullptr, 1,
                           s_heartbeat_stack, &s_heartbeat_tcb);
-    xTaskCreateStatic(usb_task,       "usb",       1024, nullptr, 1,
+    xTaskCreateStatic(usb_task,       "usb",       1024, nullptr, 4,
                       s_usb_stack,       &s_usb_tcb);
-    xTaskCreateStatic(ble_task,       "ble",       1024, nullptr, 2,
+    xTaskCreateStatic(ble_task,       "ble",       1024, nullptr, 4,
                       s_ble_stack,       &s_ble_tcb);
 
     // Pin heartbeat to core 1; all others run on core 0 by default

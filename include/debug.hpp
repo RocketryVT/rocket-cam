@@ -9,6 +9,7 @@
 
 #include "pico/stdio_usb.h"
 
+#include "ble.hpp"
 #include "irc_tramp.hpp"
 #include "osd.hpp"
 #include "shared.hpp"   // FlightState, NOTIF_*, queue externs
@@ -49,6 +50,7 @@ static void _dbg_dispatch(char* line) {
                "  vtxpower <mW>       set VTX power (0/25/200/1000/4000)\r\n"
                "  vtxrf <on|off>      enable/disable RF output\r\n"
                "  vtxstatus           query VTX current config\r\n"
+               "  blestatus           print BLE init/advertising state\r\n"
                "  cam                 toggle camera record\r\n"
                "  arm                 alias: state BOOST\r\n"
                "  land                alias: state END\r\n"
@@ -115,8 +117,15 @@ static void _dbg_dispatch(char* line) {
         else if (mw==1000) p = VtxPower::MW1000;
         else if (mw==4000) p = VtxPower::MW4000;
         else { printf("power: 0 25 200 1000 4000\r\n"); return; }
-        g_vtx.set_power(vtx_power_mw(p));
-        printf("power=%dmW\r\n", mw);
+        if (p == VtxPower::PIT) {
+            g_vtx.set_active(false);
+            printf("pit=on\r\n");
+        } else {
+            g_vtx.set_active(true);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            g_vtx.set_power(vtx_power_mw(p));
+            printf("power=%dmW pit=off\r\n", mw);
+        }
 
     } else if (strcasecmp(cmd, "vtxrf") == 0 && arg1) {
         bool on = strcasecmp(arg1,"on") == 0;
@@ -131,6 +140,11 @@ static void _dbg_dispatch(char* line) {
                    s.pit_mode ? "yes" : "no");
         else
             printf("no response from VTX\r\n");
+
+    } else if (strcasecmp(cmd, "blestatus") == 0) {
+        printf("ble_ready=%s init_result=%d\r\n",
+               ble_is_ready() ? "yes" : "no",
+               ble_init_result());
 
     } else if (strcasecmp(cmd, "cam") == 0) {
         camera_pulse_from_task();
@@ -167,6 +181,9 @@ void usb_task(void*) {
     }
 
     printf("\r\n=== rocket-cam debug console ===\r\n");
+    printf("BLE: ready=%s init_result=%d\r\n",
+           ble_is_ready() ? "yes" : "no",
+           ble_init_result());
     printf("type 'help' for commands\r\n> ");
     fflush(stdout);
 

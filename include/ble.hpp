@@ -15,9 +15,15 @@
 
 #include "shared.hpp"  // CamCmd, CamCfg
 
-// Initialise BTstack, the GATT server, and start advertising as "RocketCam".
-// Call once, after cyw43_arch_init(), from a FreeRTOS task.
-void ble_init();
+// Initialise CYW43/BTstack, the GATT server, and start advertising as
+// "RocketCam". Call once from a FreeRTOS task.
+bool ble_init();
+
+// True after BLE advertising setup has completed.
+bool ble_is_ready();
+
+// 0 after successful init; otherwise the cyw43_arch_init() error code.
+int ble_init_result();
 
 // Flight loop: pull a pending BLE command (returns false if none). Clears the
 // pending flag. Safe to call from a normal task.
